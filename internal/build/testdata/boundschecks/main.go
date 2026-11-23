@@ -68,6 +68,9 @@ func main() {
 		len(sliceArrayPointer(arrayPointer, 1, 3)), cap(sliceArrayPointer(arrayPointer, 1, 3)),
 		len(sliceThree(slice, 1, 3, 4)), cap(sliceThree(slice, 1, 3, 4)),
 	)
+	// Element values pin the data pointer of a sliced array: an -B build must
+	// advance by elements of the array rather than by whole arrays.
+	println(sliceArray(array, 1, 3)[0], sliceArrayPointer(arrayPointer, 1, 3)[0], sliceThree(slice, 1, 3, 4)[0])
 	arrayFromPointer := shortSliceToArrayPointer(slice)
 	arrayValue := shortSliceToArrayValue(slice)
 	println(arrayFromPointer[0], arrayFromPointer[3], arrayValue[1], arrayValue[2])

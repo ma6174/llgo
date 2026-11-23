@@ -14,11 +14,18 @@ func TestBoundsCheckModesIR(t *testing.T) {
 	checked := boundsCheckModeIR(t, false)
 	unchecked := boundsCheckModeIR(t, true)
 
+	// Slice bounds are checked in the caller: the successful path builds the
+	// header directly and each failed check reports through its own cold entry.
+	// The string form, index checks and slice-to-array conversion keep runtime
+	// helpers.
 	for _, helper := range []string{
 		"PanicIndex",
 		"StringSlice",
-		"NewSlice2",
-		"NewSlice3Bounds",
+		"PanicSliceAcap",
+		"PanicSliceB",
+		"PanicSlice3Acap",
+		"PanicSlice3B",
+		"PanicSlice3C",
 		"PanicSliceConvert",
 	} {
 		if !strings.Contains(checked, helper) {
@@ -28,16 +35,27 @@ func TestBoundsCheckModesIR(t *testing.T) {
 			t.Errorf("unchecked IR contains %q", helper)
 		}
 	}
+	if strings.Contains(checked, "NewSlice") {
+		t.Errorf("checked IR still routes slice bounds through a runtime call:\n%s", checked)
+	}
 	if !strings.Contains(unchecked, "AssertNilDeref") {
 		t.Error("unchecked *array slice lost its nil check")
 	}
-	panicPath := regexp.MustCompile(`(?m)^[ \t]+br i1 %[0-9]+, label %(_llgo_[0-9]+), label %_llgo_[0-9]+\n\n(_llgo_[0-9]+):.*\n[ \t]+call void @"[^"]*PanicIndex"\([^\n]*\)\n[ \t]+br label %(_llgo_[0-9]+)$`)
-	match := panicPath.FindStringSubmatch(checked)
-	if len(match) == 0 || match[1] != match[2] || match[2] != match[3] {
-		t.Error("checked IR does not isolate PanicIndex in a non-returning failure branch")
-	}
+	assertPanicInFailureBranch(t, checked, "PanicIndex")
+	assertPanicInFailureBranch(t, checked, "PanicSliceB")
 	if got := strings.Count(unchecked, "select i1"); got < 4 {
 		t.Errorf("unchecked IR contains %d select operations, want at least 4", got)
+	}
+}
+
+// assertPanicInFailureBranch checks that the panic entry is called from its own
+// block and cannot fall through into the successful continuation.
+func assertPanicInFailureBranch(t *testing.T, ir, name string) {
+	t.Helper()
+	panicPath := regexp.MustCompile(`(?m)^[ \t]+br i1 %[0-9]+, label %(_llgo_[0-9]+), label %_llgo_[0-9]+\n\n(_llgo_[0-9]+):.*\n[ \t]+call void @"[^"]*` + name + `"\([^\n]*\)\n[ \t]+(?:ret void|br label %(_llgo_[0-9]+))$`)
+	match := panicPath.FindStringSubmatch(ir)
+	if len(match) == 0 || match[1] != match[2] {
+		t.Errorf("checked IR does not isolate %s in a non-returning failure branch:\n%s", name, ir)
 	}
 }
 

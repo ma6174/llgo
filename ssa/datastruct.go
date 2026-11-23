@@ -400,7 +400,6 @@ func (b Builder) Slice(x, low, high, max Expr) (ret Expr) {
 	nativeIndices := (low.IsNil() || prog.SizeOf(low.Type) <= prog.SizeOf(prog.Int())) &&
 		(high.IsNil() || prog.SizeOf(high.Type) <= prog.SizeOf(prog.Int()))
 	var nCap Expr
-	var nEltSize Expr
 	var base Expr
 	var lowIsNil = low.IsNil()
 	var lowArg Expr
@@ -444,7 +443,6 @@ func (b Builder) Slice(x, low, high, max Expr) (ret Expr) {
 		}
 		return
 	case *types.Slice:
-		nEltSize = SizeOf(prog, prog.Index(x.Type))
 		nCap = b.SliceCap(x)
 		if high.IsNil() {
 			high = b.SliceLen(x)
@@ -464,7 +462,6 @@ func (b Builder) Slice(x, low, high, max Expr) (ret Expr) {
 			}
 			elem := prog.rawType(te.Elem())
 			ret.Type = prog.Slice(elem)
-			nEltSize = SizeOf(prog, elem)
 			nCap = prog.IntVal(uint64(te.Len()), prog.Int())
 			upperIsLen = true
 			if high.IsNil() {
@@ -486,33 +483,29 @@ func (b Builder) Slice(x, low, high, max Expr) (ret Expr) {
 		ret.impl = b.sliceUnchecked(ret.Type, base, low, high, upper).impl
 		return
 	}
+	// Check the bounds here rather than in a runtime entry: the successful path
+	// then costs one comparison per bound instead of a call that carries the
+	// whole index pair, and the header construction is the one the unchecked
+	// lowering already uses. Ranges are checked against the next one up, so a
+	// failure reports the same index pair and text as gc.
 	if max.IsNil() {
-		ret.impl = b.InlineCall(
-			b.Pkg.rtFunc("NewSlice2"),
-			base,
-			nEltSize,
-			nCap,
-			lowArg,
-			highArg,
-			prog.BoolVal(lowSigned),
-			prog.BoolVal(highSigned),
-			prog.BoolVal(upperIsLen),
-		).impl
+		upperPanic := "PanicSliceAcap"
+		if upperIsLen {
+			upperPanic = "PanicSliceAlen"
+		}
+		b.checkSliceIndex(highArg, nCap, highSigned, upperPanic)
+		b.checkSliceIndex(lowArg, highArg, lowSigned, "PanicSliceB")
+		ret.impl = b.sliceUnchecked(ret.Type, base, low, high, nCap).impl
 		return
 	}
-	ret.impl = b.InlineCall(
-		b.Pkg.rtFunc("NewSlice3Bounds"),
-		base,
-		nEltSize,
-		nCap,
-		lowArg,
-		highArg,
-		maxArg,
-		prog.BoolVal(lowSigned),
-		prog.BoolVal(highSigned),
-		prog.BoolVal(maxSigned),
-		prog.BoolVal(upperIsLen),
-	).impl
+	upperPanic := "PanicSlice3Acap"
+	if upperIsLen {
+		upperPanic = "PanicSlice3Alen"
+	}
+	b.checkSliceIndex(maxArg, nCap, maxSigned, upperPanic)
+	b.checkSliceIndex(highArg, maxArg, highSigned, "PanicSlice3B")
+	b.checkSliceIndex(lowArg, highArg, lowSigned, "PanicSlice3C")
+	ret.impl = b.sliceUnchecked(ret.Type, base, low, high, max).impl
 	return
 }
 
@@ -528,13 +521,57 @@ func (b Builder) stringSliceUnchecked(x, low, high Expr) Expr {
 func (b Builder) sliceUnchecked(t Type, base, low, high, upper Expr) Expr {
 	length := b.impl.CreateSub(high.impl, low.impl, "")
 	capacity := b.impl.CreateSub(upper.impl, low.impl, "")
-	advanced := b.Advance(base, low)
+	// Advance by elements of the slice, not by elements of base: the source of
+	// an *array slice is a pointer to the whole array, so scaling by its type
+	// would move by array-sized steps.
+	elem := b.Prog.Pointer(b.Prog.Index(t))
+	data := Expr{castPtr(b.impl, base.impl, elem.ll), elem}
+	advanced := b.Advance(data, low)
 	zero := llvm.ConstInt(capacity.Type(), 0, false)
 	hasCapacity := llvm.CreateICmp(b.impl, llvm.IntSGT, capacity, zero)
 	base.impl = llvm.CreateSelect(b.impl, hasCapacity, advanced.impl, base.impl)
 	ret := b.unsafeSlice(base, length, capacity)
 	ret.Type = t
 	return ret
+}
+
+// checkSliceIndex requires idx <= limit. idx arrives widened to i64, and limit
+// is widened the same way the runtime compared it, so both operand types match
+// on a 32-bit target. Comparing them unsigned rejects a negative signed index
+// and an unsigned index whose high bit is set in one step, and comparing at i64
+// keeps a 64-bit index intact where the word is 32 bits. branchyAssert keeps
+// that comparison in the hot path and calls report, which owns the panic code
+// and text, from a cold block only.
+func (b Builder) checkSliceIndex(idx, limit Expr, signed bool, report string) {
+	if !sliceIndexNeedsCheck(idx, limit) {
+		return
+	}
+	wideLimit, _ := b.boundsArg(limit)
+	over := Expr{llvm.CreateICmp(b.impl, llvm.IntUGT, idx.impl, wideLimit.impl), b.Prog.Bool()}
+	b.branchyAssert(over, func() {
+		b.Call(b.Pkg.rtFunc(report), idx, b.Prog.BoolVal(signed), b.FitIntSize(limit))
+	})
+}
+
+// sliceIndexNeedsCheck reports whether idx > limit can fail. Constant operands
+// that are in range need no guard, which keeps a constant slice expression - a
+// make folded into a stack array, or fixed indices into one - free of branches.
+// Slice bounds are inclusive, unlike the index bound of indexNeedsCheck.
+func sliceIndexNeedsCheck(idx, limit Expr) bool {
+	if idx.kind == vkSigned {
+		v, ok := isConstantInt(idx)
+		if !ok {
+			return true
+		}
+		m, ok := isConstantInt(limit)
+		return !ok || uint64(v) > uint64(m)
+	}
+	v, ok := isConstantUint(idx)
+	if !ok {
+		return true
+	}
+	m, ok := isConstantUint(limit)
+	return !ok || v > m
 }
 
 // SliceLit creates a new slice with the specified elements.

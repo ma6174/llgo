@@ -33,43 +33,52 @@ type Slice struct {
 	cap  int
 }
 
-func NewSlice2(base unsafe.Pointer, eltSize, cap int, i, j int64, iSigned, jSigned, upperIsLen bool) (s Slice) {
-	// cap is non-negative. Converting both indexes to uint64 makes the
-	// successful-path checks independent of the source index signedness: a
-	// negative signed index, and an unsigned index whose high bit is set, both
-	// compare above the non-negative bound. Keep the signed flags only for the
-	// panic text on the cold path.
-	if uint64(j) > uint64(cap) {
-		upperCode := boundsSliceAcap
-		if upperIsLen {
-			upperCode = boundsSliceAlen
-		}
-		panicBounds(j, jSigned, cap, upperCode)
-	}
-	if uint64(i) > uint64(j) {
-		panicBounds(i, iSigned, int(j), boundsSliceB)
-	}
-	return newSliceUnchecked(base, eltSize, int(i), int(j), cap)
+// The slice bounds checks themselves live in the caller: the compiler emits the
+// comparisons inline and branches to one of the entries below only when a check
+// failed, which keeps the successful path free of a call. Each entry owns one
+// boundsError code, so the panic text stays here instead of being spelled by the
+// compiler, and each takes the failing index together with the bound it was
+// compared against.
+//
+// The comparison is unsigned on the widened index: a negative signed index and
+// an unsigned index whose high bit is set both compare above the non-negative
+// bound, so one comparison covers both. signed therefore only selects the panic
+// text.
+
+// PanicSliceAcap and PanicSliceAlen report a failed upper-bound check of a
+// two-index slice expression: x is the upper index and y is the slice capacity
+// or, for an addressable array, its length.
+func PanicSliceAcap(x int64, signed bool, y int) {
+	panicBounds(x, signed, y, boundsSliceAcap)
 }
 
-func NewSlice3Bounds(base unsafe.Pointer, eltSize, cap int, i, j, k int64, iSigned, jSigned, kSigned, upperIsLen bool) (s Slice) {
-	// As in NewSlice2, check from the upper bound down so each successful
-	// uint64 comparison establishes 0 <= index <= bound. Since cap fits int,
-	// k and then j also fit int before the subsequent checks and conversions.
-	if uint64(k) > uint64(cap) {
-		upperCode := boundsSlice3Acap
-		if upperIsLen {
-			upperCode = boundsSlice3Alen
-		}
-		panicBounds(k, kSigned, cap, upperCode)
-	}
-	if uint64(j) > uint64(k) {
-		panicBounds(j, jSigned, int(k), boundsSlice3B)
-	}
-	if uint64(i) > uint64(j) {
-		panicBounds(i, iSigned, int(j), boundsSlice3C)
-	}
-	return newSliceUnchecked(base, eltSize, int(i), int(j), int(k))
+func PanicSliceAlen(x int64, signed bool, y int) {
+	panicBounds(x, signed, y, boundsSliceAlen)
+}
+
+// PanicSliceB reports a failed lower-bound check of a two-index slice
+// expression: x is the lower index and y the upper one.
+func PanicSliceB(x int64, signed bool, y int) {
+	panicBounds(x, signed, y, boundsSliceB)
+}
+
+// PanicSlice3Acap and PanicSlice3Alen report a failed upper-bound check of a
+// three-index slice expression, PanicSlice3B its failed middle check and
+// PanicSlice3C its failed lower one.
+func PanicSlice3Acap(x int64, signed bool, y int) {
+	panicBounds(x, signed, y, boundsSlice3Acap)
+}
+
+func PanicSlice3Alen(x int64, signed bool, y int) {
+	panicBounds(x, signed, y, boundsSlice3Alen)
+}
+
+func PanicSlice3B(x int64, signed bool, y int) {
+	panicBounds(x, signed, y, boundsSlice3B)
+}
+
+func PanicSlice3C(x int64, signed bool, y int) {
+	panicBounds(x, signed, y, boundsSlice3C)
 }
 
 func NewSlice3(base unsafe.Pointer, eltSize, cap, i, j, k int) (s Slice) {
