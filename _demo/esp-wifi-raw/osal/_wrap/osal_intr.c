@@ -134,7 +134,9 @@ __attribute__((used)) void llgo_osal_trap_dispatch(uint32_t mcause) {
     if (line >= OSAL_INT_OFFSET && line - OSAL_INT_OFFSET < OSAL_INT_COUNT) {
         osal_isr_entry_t e = s_osal_handlers[line - OSAL_INT_OFFSET];
         if (e.fn != 0) {
+            llgo_osal_isr_nest++; /* _is_from_isr true for the handler body */
             e.fn(e.arg);
+            llgo_osal_isr_nest--;
         } else {
             /* Spurious or unhandled: leave the handler unset state visible
              * in a register-visible way instead of hanging silently. */
@@ -172,8 +174,10 @@ __attribute__((naked, aligned(64))) void llgo_osal_trap_entry(void) {
         "sw t5, 56(sp)\n"
         "sw t6, 60(sp)\n"
         "csrr a0, mcause\n"
-        /* a0 < 0 (bit31 set): interrupt -> dispatch; else exception chain */
-        "bltz a0, 2f\n"
+        /* mcause bit31 set (negative) = interrupt: falls through to the
+         * dispatch; bit31 clear (>= 0) = exception: chains to the boot trap
+         * at label 2. */
+        "bgez a0, 2f\n"
         "call llgo_osal_trap_dispatch\n"
         /* interrupt path: full restore, mret */
         "lw ra, 0(sp)\n"

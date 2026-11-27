@@ -13,7 +13,7 @@ import "sync"
 type EventHandler struct {
 	arg  uintptr
 	cfn  uintptr
-	gofn func(arg, base uintptr, id int32, data uintptr)
+	gofn func(arg, base uintptr, id int32, data uintptr, size uintptr)
 }
 
 var (
@@ -23,7 +23,7 @@ var (
 
 // EventRegister adds a handler for (base, id); id==-1 matches any id
 // (ESP_EVENT_ANY_ID).
-func EventRegister(base uintptr, id int32, fn func(arg, base uintptr, id int32, data uintptr), arg uintptr) {
+func EventRegister(base uintptr, id int32, fn func(arg, base uintptr, id int32, data uintptr, size uintptr), arg uintptr) {
 	eventMu.Lock()
 	defer eventMu.Unlock()
 	m := eventHandlers[base]
@@ -87,7 +87,7 @@ func dispatchEvent(base uintptr, id int32, data uintptr, size uintptr) {
 
 	for _, h := range handlers {
 		if h.gofn != nil {
-			h.gofn(h.arg, base, id, data)
+			h.gofn(h.arg, base, id, data, size)
 		} else if h.cfn != 0 {
 			callEventHandler(h.cfn, h.arg, base, id, data)
 		}

@@ -144,6 +144,52 @@ func apiCall(f func() int32) int32 {
 	return f()
 }
 
+// ---- event subscription (demo-facing) ----
+
+// Event IDs (esp_wifi_types_generic.h wifi_event_t).
+const (
+	EvWiFiReady        = 0
+	EvScanDone         = 1
+	EvStaStart         = 2
+	EvStaStop          = 3
+	EvStaConnected     = 4
+	EvStaDisconnected  = 5
+	EvApStart          = 6
+	EvApStop           = 7
+)
+
+var eventCh = make(chan Event, 32)
+
+// Event is one dispatched WiFi event (data copied out of the C buffer).
+type Event struct {
+	ID   int32
+	Data []byte
+}
+
+// Events returns the package's event channel (buffered; drop on overflow).
+func Events() <-chan Event { return eventCh }
+
+func init() {
+	base := cWifiEventBase()
+	EventRegister(base, -1, func(arg, b uintptr, id int32, data, size uintptr) {
+		ev := Event{ID: id}
+		if data != 0 && size > 0 {
+			buf := make([]byte, size)
+			queueCopy(uintptr(unsafe0(buf)), data, size)
+			ev.Data = buf
+		}
+		select {
+		case eventCh <- ev:
+		default:
+		}
+	}, 0)
+}
+
+// cWifiEventBase returns the WIFI_EVENT base pointer value.
+//
+//go:linkname cWifiEventBase C.llgo_wifi_event_base
+func cWifiEventBase() uintptr
+
 // cstr builds a NUL-terminated C string copy (newlib malloc; freed by the
 // C shim).
 func cstr(s string) uintptr {
