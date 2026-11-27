@@ -690,14 +690,24 @@ void llgo_osal_wifi_reset_mac(void) {
 }
 
 /* wifi_clock_enable = periph_ctrl wifi_module_enable reduced to the modem
- * clock-domain ungating (HP_SYS_CLKRST.modem_conf: apb+core clk on, out of
- * reset). The per-module fine gates the modem_clock driver manages ride the
- * same domain on the emu's model. */
+ * clock bring-up, mirrored from the working IDF firmware's idle state (gdb
+ * dump, artifacts wifi-osal/logs/idf-gdb-dump.txt):
+ *   - HP_SYS_CLKRST.modem_conf: apb+core clk on, out of reset;
+ *   - MODEM_SYSCON.clk_conf_force_on (+0x0c): the wifi/bt/fe keep-clock
+ *     bytes IDF leaves at 0x64 each;
+ *   - MODEM_SYSCON.clk_conf_power_st maps (+0x14): reserved byte = 0xff,
+ *     zb/fe/bt/wifi icg maps 0x7/0xe/0x7/0xf, modem_peri 0x3.
+ * Without the MODEM_SYSCON gates the wifi MAC block gets no clock and never
+ * asserts its interrupt (the first scan attempt hung exactly there). */
+#define OSAL_MODEMSYS_BASE 0x20109C00u /* MODEM_BASE(0x20100000)+0x9c00 */
+
 void llgo_osal_wifi_clock_enable(void) {
     uint32_t conf = OSAL_REG32(0x20587000u + 0x1e0u);
     conf |= (1u << 0) | (1u << 2); /* modem_apb_clk_en | modem_clk_en */
     conf &= ~(1u << 1);            /* modem_rst_en = not-in-reset */
     OSAL_REG32(0x20587000u + 0x1e0u) = conf;
+    OSAL_REG32(OSAL_MODEMSYS_BASE + 0x0cu) |= 0x64646400u;
+    OSAL_REG32(OSAL_MODEMSYS_BASE + 0x14u) |= 0x0038e7ffu;
 }
 
 void llgo_osal_wifi_clock_disable(void) {
@@ -732,7 +742,18 @@ int llgo_osal_nvs_set_u8(uint32_t h, const char *k, uint8_t v) { (void)h; (void)
 int llgo_osal_nvs_get_u8(uint32_t h, const char *k, uint8_t *v) { (void)h; (void)k; (void)v; return OSAL_NVS_ERR; }
 int llgo_osal_nvs_set_u16(uint32_t h, const char *k, uint16_t v) { (void)h; (void)k; (void)v; return OSAL_NVS_ERR; }
 int llgo_osal_nvs_get_u16(uint32_t h, const char *k, uint16_t *v) { (void)h; (void)k; (void)v; return OSAL_NVS_ERR; }
-int llgo_osal_nvs_open(const char *name, unsigned int mode, uint32_t *out) { (void)name; (void)mode; *out = 0; return OSAL_NVS_ERR; }
+/* nvs_open must SUCCEED even with no storage behind it: wifi_init_process
+ * aborts its attach chain (wifi_lmac_init and the scan-object setup the
+ * beacon path dereferences) when wifi_nvs_init reports failure, and the
+ * vendor IDF run only works because its NVS partition opens. Reads still
+ * return NOT_FOUND so the blob falls back to defaults / full calibration;
+ * writes succeed into the void (P1 does not persist). */
+int llgo_osal_nvs_open(const char *name, unsigned int mode, uint32_t *out) {
+    (void)name;
+    (void)mode;
+    *out = 1; /* fake handle */
+    return 0;
+}
 void llgo_osal_nvs_close(uint32_t h) { (void)h; }
 int llgo_osal_nvs_commit(uint32_t h) { (void)h; return OSAL_NVS_ERR; }
 int llgo_osal_nvs_set_blob(uint32_t h, const char *k, const void *v, size_t l) { (void)h; (void)k; (void)v; (void)l; return OSAL_NVS_ERR; }

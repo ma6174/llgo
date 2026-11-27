@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # One-shot /tmp/esp-emu.lock waiter shared by the gate scripts. The lock
 # protocol across the repo is mkdir-based; some parallel agents use flock on
 # the same path (leaving a regular file behind), so a stale-looking lock is

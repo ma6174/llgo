@@ -56,10 +56,22 @@
 /* S31 interrupt routing goes through the ROM's intr_matrix_set (the chip's
  * matrix layout is ROM-private); no local register base is needed. */
 extern void intr_matrix_set(int cpu_no, uint32_t model_num, uint32_t intr_num);
-/* CPU interrupt numbers are the CLIC line numbers themselves on S31 (the
- * ROM router maps a peripheral source straight onto line 1..N; the blob's
- * first WiFi line is 1). Handlers are indexed by line-OSAL_INT_OFFSET. */
-#define OSAL_INT_OFFSET       1u
+extern void esprv_intc_int_set_priority(uint32_t intr_num, uint32_t prio);
+extern void esprv_intc_int_set_type(uint32_t intr_num, uint32_t type);
+extern void esprv_intc_int_enable(uint32_t mask);
+extern void esprv_intc_int_disable(uint32_t mask);
+extern void intr_handler_set(uint32_t int_num, void *fn, void *arg);
+/* The ROM's common interrupt entry (dispatches the intr_handler_set table).
+ * The ROM keeps it at a fixed address; its linker script exports no name,
+ * so pin the address (esp32s31.rom ELF symbol _interrupt_handler). */
+#define LLGO_ROM_INTERRUPT_HANDLER 0x2f80185cu
+/* S31 CLIC mapping (verified against the ROM's intr_matrix_set and
+ * esprv_intc_int_enable disassembly): peripheral source src routed to CPU
+ * int num lands on CLIC line num+0x10 (matrix word 0x20585000+4*src holds
+ * num+0x10), esprv_intc_int_enable(mask) toggles the IE byte of CLIC line
+ * n+0x10 for each mask bit n, and the trap's mcause carries the CLIC line
+ * number. Handlers are indexed by line-OSAL_INT_OFFSET (the blob's num). */
+#define OSAL_INT_OFFSET       16u
 #define OSAL_INT_COUNT        32u /* routable CPU interrupt lines */
 
 #define OSAL_REG32(addr) (*(volatile uint32_t *)(uintptr_t)(addr))
@@ -79,9 +91,13 @@ static inline uint32_t osal_rd_mintstatus(void) {
     return v;
 }
 
-/* Interrupt level to CLIC threshold byte (NLBITS_TO_BYTE, NLBITS=3). */
+/* Interrupt level to CLIC threshold value (NLBITS=3: level in bits [7:5],
+ * the low 5 bits are constant-1). Matches the ROM's
+ * esprv_intc_int_set_threshold exactly (level<<5 | 0x1f); writing anything
+ * else in the low bits leaves the line-level comparison inconsistent with
+ * the vendor setup (observed as IP-pending lines never trapping). */
 static inline uint32_t osal_thresh_byte(uint32_t level) {
-    return (level << 5) | 0x7u;
+    return (level << 5) | 0x1fu;
 }
 
 /* Level used by the OSAL critical section (RVHAL_EXCM_LEVEL-1 = 3): blocks
@@ -237,16 +253,21 @@ __attribute__((naked, aligned(64))) void llgo_osal_trap_entry(void) {
  * Called once before any WiFi init (Go side), after which the CLIC, matrix
  * and handler table drive the blob's interrupt setup.
  */
+static uint32_t s_osal_mtvt_table[OSAL_INT_COUNT + OSAL_INT_OFFSET];
+
 void llgo_osal_intr_init(void) {
-    uint32_t prev;
-    __asm__ volatile ("csrr %0, mtvec" : "=r"(prev));
-    llgo_osal_prev_mtvec = prev & ~3u; /* ROM/device traps are direct mode */
+    /* The wifi lines run through the ROM's vectored interrupt framework,
+     * mirrored from the working IDF firmware: the lines carry SHV=1, so the
+     * CPU vectors through mtvt[line] into the ROM _interrupt_handler, which
+     * dispatches the intr_handler_set table with the registered arg in a0.
+     * The OSAL's own mtvec trap stays for the synchronous exception chain
+     * (EBREAK exit) only - it is installed by the device boot constructor
+     * and is not touched here. */
     s_osal_intr_ready = true;
-    __asm__ volatile ("csrw mtvec, %0" :: "r"((uintptr_t)&llgo_osal_trap_entry));
-    /* mtvt only matters for CLIC vectored (SHV) lines; we keep everything
-     * non-vectored, but leave a sane table base in case the blob ever sets
-     * SHV on a line it owns. */
-    __asm__ volatile ("csrw 0x307, %0" :: "r"((uintptr_t)&llgo_osal_trap_entry));
+    for (uint32_t i = 0; i < OSAL_INT_COUNT + OSAL_INT_OFFSET; i++) {
+        s_osal_mtvt_table[i] = LLGO_ROM_INTERRUPT_HANDLER;
+    }
+    __asm__ volatile ("csrw 0x307, %0" :: "r"(&s_osal_mtvt_table[0]));
     osal_wr_mintthresh(osal_thresh_byte(0)); /* admit all levels */
     uint32_t mstatus;
     __asm__ volatile ("csrr %0, mstatus" : "=r"(mstatus));
@@ -265,19 +286,19 @@ void llgo_osal_set_intr(int32_t cpu_no, uint32_t intr_source, uint32_t intr_num,
     if (intr_num >= OSAL_INT_COUNT) {
         return;
     }
-    uint32_t line = intr_num + OSAL_INT_OFFSET;
-    /* route: the ROM knows the real S31 matrix layout - hand the whole
-     * routing over to intr_matrix_set (a ROM function; the hand-written
-     * matrix register address routed nothing and the MAC IRQ never fired). */
+    /* route + attrs through the ROM intc functions (the vendor semantics:
+     * matrix word = num+0x10, CLIC line = num+0x10, priority in the top
+     * byte as level<<5|0x1f, type LEVEL as the vendor's set_type variant
+     * leaves it). */
     intr_matrix_set(0, intr_source, intr_num);
-    /* CLIC attrs: keep SHV=0 (non-vectored), TRIG=0 (level) */
-    uint32_t ctrl = OSAL_REG32(OSAL_CLIC_CTRL_BASE + 4u * line);
-    ctrl &= ~(3u << 17); /* TRIG = level */
-    ctrl &= ~(1u << 16); /* SHV = 0 */
-    /* priority: CTL bits [31:24], NLBITS=3 -> level<<5 in the top byte */
-    ctrl &= ~(0xffu << 24);
-    ctrl |= ((uint32_t)intr_prio & 7u) << (24 + 5);
-    OSAL_REG32(OSAL_CLIC_CTRL_BASE + 4u * line) = ctrl;
+    esprv_intc_int_set_priority(intr_num, intr_prio & 7u);
+    esprv_intc_int_set_type(intr_num, 1u /* INTR_TYPE_LEVEL */);
+    /* the vendor firmware runs its lines vectored (CLICINTCTL bit16 = SHV,
+     * verified in its idle-state dump); mirror it, else the pending line
+     * waits on a direct-mode mtvec that never services interrupts. */
+    uint32_t ctrl = OSAL_REG32(OSAL_CLIC_CTRL_BASE + 4u * (intr_num + OSAL_INT_OFFSET));
+    ctrl |= (1u << 16);
+    OSAL_REG32(OSAL_CLIC_CTRL_BASE + 4u * (intr_num + OSAL_INT_OFFSET)) = ctrl;
     s_osal_handlers[intr_num].fn = 0;
     s_osal_handlers[intr_num].arg = 0;
 }
@@ -292,35 +313,42 @@ void llgo_osal_clear_intr(uint32_t intr_source, uint32_t intr_num) {
 }
 
 /* _set_isr(n, f, arg): register the handler for CPU interrupt n. */
+/* ROM-frame dispatch: _global_interrupt_handler calls fn(arg) straight from
+ * the intr_handler_set table, outside any OSAL bookkeeping. The thunk keeps
+ * the OSAL is-from-isr contract (the blob's ISR bodies branch on it). */
+typedef struct {
+    osal_isr_fn fn;
+    void *arg;
+} osal_isr_slot_t;
+static osal_isr_slot_t s_rom_slots[OSAL_INT_COUNT];
+
+static void osal_rom_isr_thunk(void *p) {
+    osal_isr_slot_t *slot = (osal_isr_slot_t *)p;
+    llgo_osal_isr_nest++;
+    slot->fn(slot->arg);
+    llgo_osal_isr_nest--;
+}
+
 void llgo_osal_set_isr(int32_t n, void *f, void *arg) {
     if (n < 0 || (uint32_t)n >= OSAL_INT_COUNT) {
         return;
     }
-    s_osal_handlers[n].fn = (osal_isr_fn)f;
-    s_osal_handlers[n].arg = arg;
+    s_rom_slots[n].fn = (osal_isr_fn)f;
+    s_rom_slots[n].arg = arg;
+    intr_handler_set((uint32_t)n, (void *)osal_rom_isr_thunk, &s_rom_slots[n]);
+    s_osal_handlers[n].fn = 0;
+    s_osal_handlers[n].arg = 0;
 }
 
 /* _ints_on/_ints_off(mask): CLIC per-line IE bits, mask indexed by CPU int
  * number (the blob passes 0b10 for int#1 and 0x200 for int#9).
  */
 void llgo_osal_ints_on(uint32_t mask) {
-    for (uint32_t n = 0; n < OSAL_INT_COUNT; n++) {
-        if (mask & (1u << n)) {
-            uint32_t line = n + OSAL_INT_OFFSET;
-            uint32_t a = OSAL_CLIC_CTRL_BASE + 4u * line;
-            OSAL_REG32(a) = OSAL_REG32(a) | (1u << 8);
-        }
-    }
+    esprv_intc_int_enable(mask);
 }
 
 void llgo_osal_ints_off(uint32_t mask) {
-    for (uint32_t n = 0; n < OSAL_INT_COUNT; n++) {
-        if (mask & (1u << n)) {
-            uint32_t line = n + OSAL_INT_OFFSET;
-            uint32_t a = OSAL_CLIC_CTRL_BASE + 4u * line;
-            OSAL_REG32(a) = OSAL_REG32(a) & ~(1u << 8);
-        }
-    }
+    esprv_intc_int_disable(mask);
 }
 
 /* _wifi_int_disable/_wifi_int_restore: the critical section pair. Single
