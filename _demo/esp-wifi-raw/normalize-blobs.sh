@@ -24,10 +24,12 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 PARTS="$DIR/idfparts"
 OUT="$PARTS/lib-soft"
 
-AR="$(ls "$HOME"/Library/Caches/llgo/crosscompile/esp-clang-*/bin/llvm-ar 2>/dev/null | sort | tail -1)"
-OBJCOPY="$(ls "$HOME"/Library/Caches/llgo/crosscompile/esp-clang-*/bin/llvm-objcopy 2>/dev/null | sort | tail -1)"
-if [[ -z "$AR" || -z "$OBJCOPY" ]]; then
-    echo "error: llvm-ar/llvm-objcopy not found in the llgo esp-clang cache" >&2
+CACHE="$(ls -d "$HOME"/Library/Caches/llgo/crosscompile/esp-clang-* 2>/dev/null | grep -v '\.lock$' | sort | tail -1)"
+AR="$CACHE/bin/llvm-ar"
+OBJCOPY="$CACHE/bin/llvm-objcopy"
+RE="$CACHE/bin/llvm-readelf"
+if [[ -z "$AR" || -z "$OBJCOPY" || -z "$RE" ]]; then
+    echo "error: llvm-ar/llvm-objcopy/llvm-readelf not found in the llgo esp-clang cache" >&2
     exit 1
 fi
 
@@ -43,6 +45,26 @@ for lib in "$PARTS"/lib/*.a; do
     (cd "$members" && "$AR" x "$lib")
     for m in "$members"/*.o; do
         "$OBJCOPY" --remove-section .riscv.attributes "$m" 2>/dev/null || true
+        # Rename the ESP32-heritage sections to the standard names the llgo
+        # linker scripts already route: blob RAM data (.dram1*) joins .data
+        # (which also keeps the XIP image's segment-offset chain intact - a
+        # separate RAM output section would shift the flash segments' file
+        # offsets and the bootloader's vaddr<->offset cross-check would
+        # refuse to boot), code sections join .text (P1 has no
+        # cache-disabled path, so cache-mapped execution is fine and SRAM
+        # stays for data), the per-level wlog string sections join .rodata.
+        for s in $("$RE" -S "$m" 2>/dev/null | awk '{ for (i=1; i<=NF; i++) if ($i ~ /^\.(dram1|wifi0iram|wifirxiram|wifislpiram|wifiorslpiram|wifislprxiram|wifiextrairam|coexiram|iram1|rodata_wlog)/) print $i }'); do
+            # Target names must stay unique per member: several blob input
+            # sections share a prefix but differ in the numeric suffix, and
+            # collapsing them onto one name makes the second objcopy rename
+            # fail (target exists) and leave the original name behind.
+            case "$s" in
+                .dram1*) dst=".data.wifi_blob${s#.dram1}" ;;
+                .rodata_wlog*) dst=".rodata.wifi_blob${s#.rodata_wlog}" ;;
+                *) dst=".text.wifi_blob${s#.wifi}" ;;
+            esac
+            "$OBJCOPY" --rename-section "$s=$dst" "$m" 2>/dev/null || true
+        done
         python3 - "$m" <<'EOF'
 import struct, sys
 path = sys.argv[1]

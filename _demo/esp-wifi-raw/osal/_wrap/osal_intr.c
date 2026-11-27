@@ -46,13 +46,21 @@
  */
 
 #include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
 #include <stddef.h>
 #include <stdbool.h>
 
 #define OSAL_CLIC_CTRL_BASE   0x10801000u
-#define OSAL_INTR_MATRIX_BASE 0x20585000u
-#define OSAL_INT_OFFSET       16u
-#define OSAL_INT_COUNT        32u /* external (routable) CPU interrupts */
+
+/* S31 interrupt routing goes through the ROM's intr_matrix_set (the chip's
+ * matrix layout is ROM-private); no local register base is needed. */
+extern void intr_matrix_set(int cpu_no, uint32_t model_num, uint32_t intr_num);
+/* CPU interrupt numbers are the CLIC line numbers themselves on S31 (the
+ * ROM router maps a peripheral source straight onto line 1..N; the blob's
+ * first WiFi line is 1). Handlers are indexed by line-OSAL_INT_OFFSET. */
+#define OSAL_INT_OFFSET       1u
+#define OSAL_INT_COUNT        32u /* routable CPU interrupt lines */
 
 #define OSAL_REG32(addr) (*(volatile uint32_t *)(uintptr_t)(addr))
 
@@ -258,10 +266,10 @@ void llgo_osal_set_intr(int32_t cpu_no, uint32_t intr_source, uint32_t intr_num,
         return;
     }
     uint32_t line = intr_num + OSAL_INT_OFFSET;
-    /* route: matrix entry for this source -> CPU int (bits [5:0]) */
-    uint32_t r = OSAL_REG32(OSAL_INTR_MATRIX_BASE + 4u * intr_source);
-    r = (r & ~63u) | (intr_num & 63u);
-    OSAL_REG32(OSAL_INTR_MATRIX_BASE + 4u * intr_source) = r;
+    /* route: the ROM knows the real S31 matrix layout - hand the whole
+     * routing over to intr_matrix_set (a ROM function; the hand-written
+     * matrix register address routed nothing and the MAC IRQ never fired). */
+    intr_matrix_set(0, intr_source, intr_num);
     /* CLIC attrs: keep SHV=0 (non-vectored), TRIG=0 (level) */
     uint32_t ctrl = OSAL_REG32(OSAL_CLIC_CTRL_BASE + 4u * line);
     ctrl &= ~(3u << 17); /* TRIG = level */

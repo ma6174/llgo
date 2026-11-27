@@ -7,4 +7,4 @@ package osal
 // references into a single argv element, so the archive and linker-script
 // paths must be baked in at generation time.
 
-const LLGoFiles = "$OSAL_CFLAGS: _wrap/osi_osal.c; _wrap/osal_intr.c; _wrap/wifi_api.c; _wrap/wifi_regulatory.c; _wrap/ftm_calibration.c"
+const LLGoFiles = "$OSAL_CFLAGS: _wrap/osi_osal.c; _wrap/osal_intr.c; _wrap/wifi_api.c; _wrap/wifi_regulatory.c; _wrap/ftm_calibration.c; _wrap/phy_init_data.c"

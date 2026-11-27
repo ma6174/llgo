@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # Run the wifi firmware under esp-emu: merge the pinned bootloader and
 # partition table (idfparts/, harvested from the same espressif/idf image)
-# with the app image at the XIP offsets, then boot. Serialized machine-wide
-# with /tmp/esp-emu.lock like every other emu acceptance run.
+# with the app image at the XIP offsets, then boot.
+#
+# LOCKING: the CALLER must hold /tmp/esp-emu.lock (mkdir) around the whole
+# invocation - this script does not take or release the lock itself, it
+# only runs the emulator inside it.
 #
 # The application drives USB-Serial/JTAG (esp32s31-flash device path), so
 # --console usb-jtag is required or every print is swallowed.
@@ -26,9 +29,6 @@ for off, name in ((0x2000, 'bootloader.bin'), (0x8000, 'partition-table.bin'), (
 open(os.path.join(d, 'flash.bin'), 'wb').write(flash)
 print('flash.bin:', len(flash), 'bytes')
 EOF
-
-while ! mkdir /tmp/esp-emu.lock 2>/dev/null; do sleep 5; done
-trap 'rmdir /tmp/esp-emu.lock 2>/dev/null' EXIT INT TERM
 
 "$EMU" --chip esp32s31 --firmware "$DIR/flash.bin" \
     --console usb-jtag --timeout 30s >"$LOG" 2>&1

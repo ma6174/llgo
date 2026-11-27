@@ -40,8 +40,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <malloc.h>
+#include <unistd.h>
 
 #include "esp_private/wifi_os_adapter.h"
+#include "esp_phy_init.h"   /* esp_phy_init_data_t, esp_phy_calibration_data_t */
+#include "phy_init_data.h"  /* phy_init_data default table (phy_init_data.c) */
 
 /* ---- Go exports referenced by the table (exported.go) ---- */
 
@@ -185,30 +188,52 @@ int32_t llgo_osal_queue_send_from_isr(void *q, void *item, void *hptw) {
 /* ---- queue create/delete: Go registry + C ring, both keyed by the handle ---- */
 
 
+/* _wifi_create_queue contract (pinned IDF esp32s31/esp_adapter.c:
+ * wifi_create_queue): the return value is a wifi_static_queue_t* - the blob
+ * dereferences it (pp_create_task reads the handle at offset 0 and publishes
+ * it to the ROM xphyQueue slot), so this cannot be an opaque integer like
+ * the plain _os_queue_create handles. The wrapper carries our opaque queue
+ * id in the handle field and no storage (our Go queue owns its buffer). */
+typedef struct {
+    uintptr_t handle; /* our opaque queue id, at the offset the blob reads */
+    void *storage;    /* FreeRTOS static-storage slot; unused here */
+} osal_wifi_queue_t;
+
 void *llgo_osal_wifi_create_queue(int queue_len, int item_size) {
-    void *h = llgo_osal_queue_create((uint32_t)queue_len, (uint32_t)item_size);
-    uintptr_t idx = (uintptr_t)h;
-    if (h != 0 && idx <= OSAL_ISR_RING_MAX) {
-        uint32_t ring_slot = idx - 1;
-        if (s_isr_rings[ring_slot] == 0) {
-            osal_isr_ring_t *r = malloc(sizeof(osal_isr_ring_t));
-            if (r != 0) {
-                memset(r, 0, sizeof(*r));
-                r->item_size = item_size > 64 ? 64 : (uint32_t)item_size;
-                s_isr_rings[ring_slot] = r;
-            }
+    uintptr_t h = (uintptr_t)llgo_osal_queue_create((uint32_t)queue_len, (uint32_t)item_size);
+    if (h == 0 || h > OSAL_ISR_RING_MAX) {
+        return 0;
+    }
+    uint32_t ring_slot = (uint32_t)h - 1;
+    if (s_isr_rings[ring_slot] == 0) {
+        osal_isr_ring_t *r = malloc(sizeof(osal_isr_ring_t));
+        if (r != 0) {
+            memset(r, 0, sizeof(*r));
+            r->item_size = item_size > 64 ? 64 : (uint32_t)item_size;
+            s_isr_rings[ring_slot] = r;
         }
     }
-    return h;
+    osal_wifi_queue_t *w = malloc(sizeof(osal_wifi_queue_t));
+    if (w == 0) {
+        return 0;
+    }
+    w->handle = h;
+    w->storage = 0;
+    return w;
 }
 
 void llgo_osal_wifi_delete_queue(void *q) {
-    uintptr_t idx = (uintptr_t)q;
-    if (idx >= 1 && idx <= OSAL_ISR_RING_MAX) {
-        free(s_isr_rings[idx - 1]);
-        s_isr_rings[idx - 1] = 0;
+    osal_wifi_queue_t *w = (osal_wifi_queue_t *)q;
+    if (w == 0) {
+        return;
     }
-    llgo_osal_queue_delete(q);
+    uintptr_t h = w->handle;
+    if (h >= 1 && h <= OSAL_ISR_RING_MAX) {
+        free(s_isr_rings[h - 1]);
+        s_isr_rings[h - 1] = 0;
+    }
+    llgo_osal_queue_delete((void *)h);
+    free(w);
 }
 
 /* ---- queue_recv with ISR-ring drain (Go owns the park; this is the C
@@ -224,6 +249,104 @@ int32_t llgo_osal_queue_recv_wrap(void *q, void *item, uint32_t tick) {
 }
 
 /* ---- blob-facing helpers ---- */
+
+/* ---- ROM newlib syscall table ----
+ * The ESP32-S31 ROM's newlib entries are table-jump stubs: they load
+ * `syscall_table_ptr` (ROM BSS at 0x2f07ffc8, zero-initialized here - the
+ * emu's ROM model does not run the ROM's own init) and jump through a slot
+ * (observed: __getreent slot 0, _malloc_r slot 4, _printf_float slot 0x88,
+ * __sinit slot 0x94). Any call reaching such a stub with the pointer still
+ * NULL faults on the slot dereference. This device has strong newlib
+ * implementations of everything the ROM table routes to, so install a
+ * static table that pins every slot used by ROM entries to a safe target:
+ * the known slots to the matching strong symbols, everything else to a
+ * logging abort stub. */
+extern void **syscall_table_ptr;
+
+/* The strong device-libc implementations the table routes to. malloc.h /
+ * stdlib.h (included above) already carry the _r allocator prototypes;
+ * reent/stdio prototypes come from the same headers, so only the entries
+ * without a usable declaration are spelled out here. */
+extern struct _reent *__getreent(void);
+extern int _fstat_r(struct _reent *, int, void *);
+extern void *_sbrk_r(struct _reent *, int);
+/* Internal newlib stdio initializer - no public header declares it. */
+extern void __sinit(struct _reent *);
+
+/* Newlib stdio retarget locks (syscall table slots 0x74/0x84). The ROM stdio
+ * paths (the blob's direct printf calls land there) take and release these
+ * around every FILE operation. Single-hart cooperative fibers never observe
+ * concurrent stdio, and no OSAL entry yields inside a stdio call, so no-op
+ * bodies are sufficient for P1. */
+static void osal_lock_noop(void) {}
+
+static void *s_rom_syscall_table[42]; /* covers slot 0x98 and a little more */
+
+/* Slot-catch-all: called when a ROM stub jumps through a slot we did not
+ * route deliberately. The slot-jump stubs tail into the table entry, so the
+ * return address is the ROM stub itself - print it so a new ROM caller shows
+ * up as an identifiable address instead of a bare fault. Manual hex (no
+ * newlib stdio in this path). */
+static void osal_print_hex(uintptr_t v) {
+    char buf[11];
+    buf[0] = '0';
+    buf[1] = 'x';
+    for (int i = 9; i >= 2; i--) {
+        unsigned d = (unsigned)(v & 0xfu);
+        buf[i] = d < 10 ? ('0' + d) : ('a' + d - 10);
+        v >>= 4;
+    }
+    buf[10] = '\n';
+    write(1, buf, sizeof(buf));
+}
+
+static void *llgo_osal_rom_slot_miss(void) {
+    static const char msg[] = "osal: ROM syscall slot miss, stub=";
+    uintptr_t ra;
+    __asm__ volatile ("mv %0, ra" : "=r"(ra));
+    write(1, msg, sizeof(msg) - 1);
+    osal_print_hex(ra);
+    return 0;
+}
+
+void llgo_osal_boot_install(void) {
+    static const char ok[] = "osal: syscall table installed\n";
+    for (unsigned i = 0; i < 42; i++) {
+        s_rom_syscall_table[i] = (void *)llgo_osal_rom_slot_miss;
+    }
+    /* Slot offsets read off the ROM stub disassembly (each stub loads
+     * syscall_table_ptr then jumps through its slot); routed to the matching
+     * strong device-libc implementations so a stray ROM newlib call behaves
+     * instead of faulting. Unrouted slots (assert helper, _printf_float,
+     * _cleanup_r) stay on the logging catch-all so their callers show up as
+     * text. */
+    s_rom_syscall_table[0] = (void *)__getreent;   /* __getreent      0x00 */
+    s_rom_syscall_table[1] = (void *)_malloc_r;    /* malloc          0x04 */
+    s_rom_syscall_table[2] = (void *)_free_r;      /* _free_r         0x08 */
+    s_rom_syscall_table[3] = (void *)_realloc_r;   /* _realloc_r      0x0c */
+    s_rom_syscall_table[5] = (void *)abort;        /* abort           0x14 */
+    s_rom_syscall_table[14] = (void *)_fstat_r;    /* _fstat_r        0x38 */
+    s_rom_syscall_table[15] = (void *)_sbrk_r;     /* _sbrk_r         0x3c */
+    s_rom_syscall_table[29] = (void *)osal_lock_noop; /* acquire_recursive 0x74 */
+    s_rom_syscall_table[33] = (void *)osal_lock_noop; /* release_recursive 0x84 */
+    s_rom_syscall_table[37] = (void *)__sinit;     /* __sinit         0x94 */
+    syscall_table_ptr = s_rom_syscall_table;
+    /* The ROM code was built hard-float: even non-FP library entries carry
+     * fsw/flw prologue saves (ROM setjmp does), and the boot state leaves
+     * mstatus.FS off, so any of those executing traps illegal-instruction.
+     * This core has an FPU - turn it on (FS = Initial, bits 14:13 = 01). */
+    __asm__ volatile("csrs mstatus, %0" :: "r"(1u << 14) : "memory");
+    write(1, ok, sizeof(ok) - 1);
+}
+
+/* Run from crt0's __libc_init_array (the same hook the device file uses for
+ * its WDT/trap setup) - before main and before Go package inits, i.e. before
+ * anything can reach a ROM newlib entry. */
+__attribute__((constructor)) static void osal_boot_early(void) {
+    static const char hi[] = "osal: constructor\n";
+    write(1, hi, sizeof(hi) - 1);
+    llgo_osal_boot_install();
+}
 
 /* Goroutine trampoline for _task_create: enter a library task body through
  * its raw C function pointer (espradio's espradio_run_task shape; the Go
@@ -314,6 +437,33 @@ int mesh_printf(const char *format, ...) {
     int n = osal_lib_printf(format, args);
     va_end(args);
     return n;
+}
+
+/* phy_printf: libphy's logging entry (referenced by register_chipv7_phy and
+ * friends once the PHY calibration member joins the link). */
+int phy_printf(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    int n = osal_lib_printf(format, args);
+    va_end(args);
+    return n;
+}
+
+/* coexist_printf: libcoexist's logging entry. */
+int coexist_printf(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    int n = osal_lib_printf(format, args);
+    va_end(args);
+    return n;
+}
+
+/* rtc_clk_xtal_freq_get: the hal clock query register_chipv7_phy needs.
+ * Routes to the ROM's ets_clk_get_xtal_freq, which reads the real clock
+ * config (the emu models those registers). */
+extern unsigned int ets_clk_get_xtal_freq(void);
+unsigned int rtc_clk_xtal_freq_get(void) {
+    return ets_clk_get_xtal_freq();
 }
 
 /* ---- log ---- */
@@ -492,18 +642,37 @@ int llgo_osal_read_mac(uint8_t *mac, unsigned int type) {
 
 /* ---- PHY / modem clock / low power ---- */
 
-/* _phy_enable/_phy_disable: on hardware these drive esp_phy_enable
- * (modem clock gates, BB PLL init, RF calibration). P1 stubs them: the emu's
- * WiFi model answers at the MAC layer, and both entry points are logged so
- * a real-hardware bring-up sees exactly what has to be ported first.
- * The TRNG clock also rides the modem clock domain - until the PHY port
- * lands, rand() above may read a static register value on hardware (emu
- * synthesizes TRNG data).
- */
+/* _phy_enable drives esp_phy_enable reduced to the hardware-independent
+ * core (phy_init.c): param table install + first-time full RF calibration
+ * via register_chipv7_phy, then phy_wakeup_init on later enables. The emu
+ * models the RF/I2C hardware the ROM PHY code drives, so the real
+ * calibration flow runs against it. No PMU/REGDMA/sleep-retention branches
+ * (all off in this sdkconfig), and no modem clock gating (emu clocks are
+ * always on). */
 extern void llgo_osal_note_stub(const char *what);
 
+extern int register_chipv7_phy(const esp_phy_init_data_t *init_data,
+                               esp_phy_calibration_data_t *cal_data,
+                               esp_phy_calibration_mode_t mode);
+extern void phy_wakeup_init(void);
+
+static bool s_phy_calibrated;
+
 void llgo_osal_phy_enable(void) {
-    llgo_osal_note_stub("phy_enable");
+    phy_init_param_set(1);
+    if (!s_phy_calibrated) {
+        /* No NVS (P1 stubs): no stored calibration data -> full calibration,
+         * exactly IDF's first-boot path. The cal record is dropped instead of
+         * persisted; every boot recalibrates. */
+        esp_phy_calibration_data_t *cal = calloc(1, sizeof(esp_phy_calibration_data_t));
+        if (cal != 0) {
+            register_chipv7_phy(&phy_init_data, cal, PHY_RF_CAL_FULL);
+            free(cal);
+        }
+        s_phy_calibrated = true;
+    } else {
+        phy_wakeup_init();
+    }
 }
 
 void llgo_osal_phy_disable(void) {
@@ -520,8 +689,15 @@ void llgo_osal_wifi_reset_mac(void) {
     llgo_osal_note_stub("wifi_reset_mac");
 }
 
+/* wifi_clock_enable = periph_ctrl wifi_module_enable reduced to the modem
+ * clock-domain ungating (HP_SYS_CLKRST.modem_conf: apb+core clk on, out of
+ * reset). The per-module fine gates the modem_clock driver manages ride the
+ * same domain on the emu's model. */
 void llgo_osal_wifi_clock_enable(void) {
-    llgo_osal_note_stub("wifi_clock_enable");
+    uint32_t conf = OSAL_REG32(0x20587000u + 0x1e0u);
+    conf |= (1u << 0) | (1u << 2); /* modem_apb_clk_en | modem_clk_en */
+    conf &= ~(1u << 1);            /* modem_rst_en = not-in-reset */
+    OSAL_REG32(0x20587000u + 0x1e0u) = conf;
 }
 
 void llgo_osal_wifi_clock_disable(void) {
@@ -563,33 +739,113 @@ int llgo_osal_nvs_set_blob(uint32_t h, const char *k, const void *v, size_t l) {
 int llgo_osal_nvs_get_blob(uint32_t h, const char *k, void *v, size_t *l) { (void)h; (void)k; (void)v; (void)l; return OSAL_NVS_ERR; }
 int llgo_osal_nvs_erase_key(uint32_t h, const char *k) { (void)h; (void)k; return OSAL_NVS_ERR; }
 
-/* ---- COEX: no BT, the WiFi-only stub set (IDF CONFIG_SW_COEXIST_ENABLE=n
- * branch returns constants; statuses mimic "wifi owns the radio") ---- */
+/* ---- COEX: the blob was built with CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+ * (pinned sdkconfig.h line 603), so these forward to the real libcoexist
+ * scheduler instead of stubs - the wifi pm module registers ROM callbacks
+ * that dereference the coex state, and stubbing init left that state NULL
+ * (crash inside pm_coex_recalculate_wifi_time_slice on the first scan). */
 
-int llgo_osal_coex_init(void) { return 0; }
-void llgo_osal_coex_deinit(void) {}
-int llgo_osal_coex_enable(void) { return 0; }
-void llgo_osal_coex_disable(void) {}
-uint32_t llgo_osal_coex_status_get(void) { return 1; }
-void llgo_osal_coex_condition_set(uint32_t type, bool dissatisfy) { (void)type; (void)dissatisfy; }
-int llgo_osal_coex_wifi_request(uint32_t event, uint32_t latency, uint32_t duration) { (void)event; (void)latency; (void)duration; return 0; }
-int llgo_osal_coex_wifi_release(uint32_t event) { (void)event; return 0; }
-int llgo_osal_coex_wifi_channel_set(uint8_t primary, uint8_t secondary) { (void)primary; (void)secondary; return 0; }
-int llgo_osal_coex_event_duration_get(uint32_t event, uint32_t *duration) { (void)event; if (duration) *duration = 0; return 0; }
-int llgo_osal_coex_pti_get(uint32_t event, uint8_t *pti) { (void)event; if (pti) *pti = 0; return 0; }
-void llgo_osal_coex_schm_status_bit_clear(uint32_t type, uint32_t status) { (void)type; (void)status; }
-void llgo_osal_coex_schm_status_bit_set(uint32_t type, uint32_t status) { (void)type; (void)status; }
-int llgo_osal_coex_schm_interval_set(uint32_t interval) { (void)interval; return 0; }
-uint32_t llgo_osal_coex_schm_interval_get(void) { return 0; }
-uint8_t llgo_osal_coex_schm_curr_period_get(void) { return 0; }
-void *llgo_osal_coex_schm_curr_phase_get(void) { return 0; }
-int llgo_osal_coex_schm_process_restart(void) { return 0; }
-int llgo_osal_coex_schm_register_cb(int kind, int (*cb)(int)) { (void)kind; (void)cb; return 0; }
-int llgo_osal_coex_register_start_cb(int (*cb)(void)) { (void)cb; return 0; }
-int llgo_osal_coex_schm_flexible_period_set(uint8_t period) { (void)period; return 0; }
-uint8_t llgo_osal_coex_schm_flexible_period_get(void) { return 0; }
-void *llgo_osal_coex_schm_get_phase_by_idx(int idx) { (void)idx; return 0; }
-int llgo_osal_coex_configure_preemption_end_cb(bool is_register, int (*cb)(uint32_t)) { (void)is_register; (void)cb; return 0; }
+#include "private/esp_coexist_adapter.h"
+#include "private/esp_coexist_internal.h"
+
+/* The coex os-adapter table (the ESP-IDF esp_coex_adapter.c shape, every
+ * function resolved to this OSAL's primitives). llgo does not run the IDF
+ * ESP_SYSTEM_INIT_FN(init_coexist) constructor that registers it, so the
+ * demo's esp_wifi_init does it by hand. */
+static void osal_coex_task_yield_from_isr(void) { llgo_osal_task_yield_from_isr(); }
+static void *osal_coex_semphr_create(uint32_t max, uint32_t init) { return llgo_osal_semphr_create(max, init); }
+static void osal_coex_semphr_delete(void *sem) { llgo_osal_semphr_delete(sem); }
+static int32_t osal_coex_semphr_take_from_isr(void *sem, void *hptw) { return llgo_osal_queue_send_from_isr(sem, hptw, 0) ? 1 : 0; }
+static int32_t osal_coex_semphr_give_from_isr(void *sem, void *hptw) { (void)sem; (void)hptw; return 1; }
+static int32_t osal_coex_semphr_take(void *sem, uint32_t tick) { return llgo_osal_semphr_take(sem, tick); }
+static int32_t osal_coex_semphr_give(void *sem) { return llgo_osal_semphr_give(sem); }
+static int osal_coex_is_in_isr(void) { return llgo_osal_is_from_isr_context(); }
+static void *osal_coex_malloc_internal(size_t size) { return malloc(size); }
+static void osal_coex_free(void *p) { free(p); }
+static int64_t osal_coex_esp_timer_get_time(void) { return llgo_osal_esp_timer_get_time(); }
+static bool osal_coex_env_is_chip(void) { return llgo_osal_env_is_chip(); }
+static void osal_coex_timer_disarm(void *t) { llgo_osal_timer_disarm(t); }
+static void osal_coex_timer_done(void *t) { llgo_osal_timer_done(t); }
+static void osal_coex_timer_setfn(void *t, void *fn, void *arg) { llgo_osal_timer_setfn(t, fn, arg); }
+static void osal_coex_timer_arm_us(void *t, uint32_t us, bool repeat) { llgo_osal_timer_arm_us(t, us, repeat ? 1 : 0); }
+static int osal_coex_debug_matrix_init(int event, int signal, bool rev) { (void)event; (void)signal; (void)rev; return 0; }
+static int osal_coex_xtal_freq_get(void) { return (int)rtc_clk_xtal_freq_get(); }
+
+coex_adapter_funcs_t g_coex_adapter_funcs = {
+    ._version = COEX_ADAPTER_VERSION,
+    ._task_yield_from_isr = osal_coex_task_yield_from_isr,
+    ._semphr_create = osal_coex_semphr_create,
+    ._semphr_delete = osal_coex_semphr_delete,
+    ._semphr_take_from_isr = osal_coex_semphr_take_from_isr,
+    ._semphr_give_from_isr = osal_coex_semphr_give_from_isr,
+    ._semphr_take = osal_coex_semphr_take,
+    ._semphr_give = osal_coex_semphr_give,
+    ._is_in_isr = osal_coex_is_in_isr,
+    ._malloc_internal = osal_coex_malloc_internal,
+    ._free = osal_coex_free,
+    ._esp_timer_get_time = osal_coex_esp_timer_get_time,
+    ._env_is_chip = osal_coex_env_is_chip,
+    ._timer_disarm = osal_coex_timer_disarm,
+    ._timer_done = osal_coex_timer_done,
+    ._timer_setfn = osal_coex_timer_setfn,
+    ._timer_arm_us = osal_coex_timer_arm_us,
+    ._debug_matrix_init = osal_coex_debug_matrix_init,
+    ._xtal_freq_get = osal_coex_xtal_freq_get,
+    ._magic = COEX_ADAPTER_MAGIC,
+};
+
+extern int coex_init(void);
+extern void coex_disable(void);
+extern int coex_enable(void);
+
+extern void coex_condition_set(uint32_t type, bool dissatisfy);
+extern int coex_wifi_request(uint32_t event, uint32_t latency, uint32_t duration);
+extern int coex_wifi_release(uint32_t event);
+extern int coex_wifi_channel_set(uint8_t primary, uint8_t secondary);
+extern int coex_event_duration_get(uint32_t event, uint32_t *duration);
+extern int coex_pti_get(uint32_t event, uint8_t *pti);
+extern void coex_schm_status_bit_clear(uint32_t type, uint32_t status);
+extern void coex_schm_status_bit_set(uint32_t type, uint32_t status);
+extern int coex_schm_interval_set(uint32_t interval);
+extern uint32_t coex_schm_interval_get(void);
+extern uint8_t coex_schm_curr_period_get(void);
+extern void *coex_schm_curr_phase_get(void);
+extern int coex_schm_process_restart(void);
+
+extern int coex_register_start_cb(int (*cb)(void));
+extern int coex_schm_flexible_period_set(uint8_t period);
+extern uint8_t coex_schm_flexible_period_get(void);
+extern void *coex_schm_get_phase_by_idx(int idx);
+/* coex_condition_set / coex_configure_preemption_end_cb exist only with a
+ * BT side present; the WiFi-only P1 build has no caller that observes them,
+ * so they stay local no-ops. */
+void coex_condition_set(uint32_t type, bool dissatisfy) { (void)type; (void)dissatisfy; }
+int coex_configure_preemption_end_cb(bool is_register, int (*cb)(uint32_t)) { (void)is_register; (void)cb; return 0; }
+
+int llgo_osal_coex_init(void) { return coex_init(); }
+void llgo_osal_coex_deinit(void) { coex_disable(); }
+int llgo_osal_coex_enable(void) { return coex_enable(); }
+void llgo_osal_coex_disable(void) { coex_disable(); }
+uint32_t llgo_osal_coex_status_get(void) { return coex_status_get(1); } /* bitmap=1: wifi */
+void llgo_osal_coex_condition_set(uint32_t type, bool dissatisfy) { coex_condition_set(type, dissatisfy); }
+int llgo_osal_coex_wifi_request(uint32_t event, uint32_t latency, uint32_t duration) { return coex_wifi_request(event, latency, duration); }
+int llgo_osal_coex_wifi_release(uint32_t event) { return coex_wifi_release(event); }
+int llgo_osal_coex_wifi_channel_set(uint8_t primary, uint8_t secondary) { return coex_wifi_channel_set(primary, secondary); }
+int llgo_osal_coex_event_duration_get(uint32_t event, uint32_t *duration) { return coex_event_duration_get(event, duration); }
+int llgo_osal_coex_pti_get(uint32_t event, uint8_t *pti) { return coex_pti_get(event, pti); }
+void llgo_osal_coex_schm_status_bit_clear(uint32_t type, uint32_t status) { coex_schm_status_bit_clear(type, status); }
+void llgo_osal_coex_schm_status_bit_set(uint32_t type, uint32_t status) { coex_schm_status_bit_set(type, status); }
+int llgo_osal_coex_schm_interval_set(uint32_t interval) { return coex_schm_interval_set(interval); }
+uint32_t llgo_osal_coex_schm_interval_get(void) { return coex_schm_interval_get(); }
+uint8_t llgo_osal_coex_schm_curr_period_get(void) { return coex_schm_curr_period_get(); }
+void *llgo_osal_coex_schm_curr_phase_get(void) { return coex_schm_curr_phase_get(); }
+int llgo_osal_coex_schm_process_restart(void) { return coex_schm_process_restart(); }
+int llgo_osal_coex_schm_register_cb(int kind, int (*cb)(int)) { return coex_schm_register_callback((coex_schm_callback_type_t)kind, (void *)cb); }
+int llgo_osal_coex_register_start_cb(int (*cb)(void)) { return coex_register_start_cb(cb); }
+int llgo_osal_coex_schm_flexible_period_set(uint8_t period) { return coex_schm_flexible_period_set(period); }
+uint8_t llgo_osal_coex_schm_flexible_period_get(void) { return coex_schm_flexible_period_get(); }
+void *llgo_osal_coex_schm_get_phase_by_idx(int idx) { return coex_schm_get_phase_by_idx(idx); }
+int llgo_osal_coex_configure_preemption_end_cb(bool is_register, int (*cb)(uint32_t)) { return coex_configure_preemption_end_cb(is_register, cb); }
 
 /* ---- sleep retention (S31 REGDMA): modem power management; P1 keeps the
  * modem always on, so every attach/detach reports "skipped" (the IDF

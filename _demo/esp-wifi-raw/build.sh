@@ -44,14 +44,14 @@ fi
   echo 'package osal'
   echo ''
   printf 'const LLGoPackage = "link: --start-group'
-  for lib in core espnow mesh net80211 pp smartconfig wapi phy; do
+  for lib in core espnow mesh net80211 pp smartconfig wapi phy coexist; do
     printf ' %s/lib%s.a' "$LIBDIR" "$lib"
   done
   printf ' --end-group'
   for f in "$PARTS"/rom/*.ld; do
     printf ' -T %s' "$f"
   done
-  printf ' -T %s' "$DIR/osal/sections.ld"
+
   echo '"'
 } > osal/link_args.go
 

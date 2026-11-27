@@ -92,6 +92,12 @@ func runTask(fn, arg uintptr)
 //go:linkname isFromISR C.llgo_osal_is_from_isr_context
 func isFromISR() int32
 
+// bootInstall pins the ROM newlib syscall table (see osi_osal.c). Must run
+// before anything can reach a ROM newlib entry.
+//
+//go:linkname bootInstall C.llgo_osal_boot_install
+func bootInstall()
+
 // isrRingGet drains one staged ISR item into dst (the C staging rings are
 // the only ISR->task bridge; see _wrap/osi_osal.c).
 //

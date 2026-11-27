@@ -170,19 +170,7 @@ type Event struct {
 func Events() <-chan Event { return eventCh }
 
 func init() {
-	base := cWifiEventBase()
-	EventRegister(base, -1, func(arg, b uintptr, id int32, data, size uintptr) {
-		ev := Event{ID: id}
-		if data != 0 && size > 0 {
-			buf := make([]byte, size)
-			queueCopy(uintptr(unsafe0(buf)), data, size)
-			ev.Data = buf
-		}
-		select {
-		case eventCh <- ev:
-		default:
-		}
-	}, 0)
+	bootInstall()
 }
 
 // cWifiEventBase returns the WIFI_EVENT base pointer value.

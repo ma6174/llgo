@@ -28,6 +28,7 @@ func waitEvent(id int32, timeout time.Duration) (osal.Event, bool) {
 }
 
 func main() {
+	osal.Boot()
 	println("wifi-raw: boot")
 	osal.IntrInit()
 	println("wifi-raw: gate1 init")

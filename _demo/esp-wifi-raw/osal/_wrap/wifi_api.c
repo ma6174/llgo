@@ -37,6 +37,7 @@ static void osal_print_line(const char *s) {
 }
 
 #include "esp_private/wifi_os_adapter.h"
+#include "private/esp_coexist_adapter.h"
 #include "esp_wifi_types.h"
 /* The real esp_wifi.h (wifi_init_config_t + the CONFIG defaults this file
  * mirrors) lives next to the shimmed flat copy; quoted relative include so
@@ -64,9 +65,23 @@ extern int esp_wifi_set_config(uint32_t ifx, wifi_config_t *conf);
 extern int esp_wifi_get_mac(uint32_t ifx, uint8_t mac[6]);
 extern int esp_wifi_set_storage(uint32_t storage);
 
+/* esp_phy's libphy.a (esp_phy_init.h); pulls the phy_init member with the
+ * parameter tables. */
+void phy_init_param_set(uint8_t param);
+
+/* libcoexist.a: the host side of esp_wifi_init calls coex_init() before the
+ * blob init (IDF wifi_init.c line ~463, CONFIG_SW_COEXIST_ENABLE branch),
+ * which brings the scheduler env up before any blob coex_schm_lock call. */
+int coex_init(void);
+esp_err_t esp_coex_adapter_register(coex_adapter_funcs_t *funcs);
+esp_err_t coex_pre_init(void);
+
 /* Regulatory tables from the pinned IDF (kept verbatim; see header). */
 extern const wifi_regdomain_t regdomain_table[];
 extern const wifi_regulatory_t regulatory_data[];
+
+/* Defined in osi_osal.c (the coex os-adapter table libcoexist needs). */
+extern coex_adapter_funcs_t g_coex_adapter_funcs;
 
 /* ---- event bases ---- */
 
@@ -165,6 +180,15 @@ int esp_wifi_init(const wifi_init_config_t *config) {
     if (s_wifi_inited) {
         return 0x1030; /* ESP_ERR_WIFI_INIT_STATE */
     }
+    /* esp_phy's system-side init, reduced to the one step the ROM PHY code
+     * hard-depends on: phy_init_param_set installs the PHY parameter table
+     * (it writes the ROM slot phy_param_rom, which the tsens/calibration
+     * paths dereference - left NULL it faults on the first store, seen as a
+     * crash inside phy_tsens_temp_read_local during wifi_sta_start). */
+    phy_init_param_set(1);
+    esp_coex_adapter_register(&g_coex_adapter_funcs);
+    coex_pre_init();
+    coex_init();
     int r = esp_wifi_init_internal(config);
     if (r != 0) {
         char msg[48];
