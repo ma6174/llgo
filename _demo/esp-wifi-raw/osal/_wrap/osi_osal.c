@@ -239,14 +239,35 @@ void llgo_osal_wifi_delete_queue(void *q) {
 /* ---- queue_recv with ISR-ring drain (Go owns the park; this is the C
  * wrapper the table points at) ---- */
 
+/* Forensics: dump the wifi g_ic scan-window words + the message's handler
+ * slot before the wifi task body dereferences it. Offsets chosen from the
+ * gate-3 crash analysis (g_ic+0x560/0x568/0x570); g_ic itself lives at
+ * g_ic_ptr slot 0x2f0033ac-linked blob global. */
+void osal_dump_msg(void *q, void *item, const char *how) {
+    volatile uint32_t *gic = (volatile uint32_t *)0x2f0033ac;
+    uint32_t *m = (uint32_t *)item;
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+             "qmsg %s q=0x%p h=0x%08x a0=0x%08x a1=0x%08x | gic+0x560=0x%08x +0x568=0x%08x +0x570=0x%08x\n",
+             how, q, m[0], m[1], m[2],
+             gic[0x560 / 4], gic[0x568 / 4], gic[0x570 / 4]);
+    write(1, buf, strlen(buf));
+}
+
 int32_t llgo_osal_queue_recv_wrap(void *q, void *item, uint32_t tick) {
     /* Drain staged ISR items first so an ISR post wakes the parked recv on
      * its next bounded-park tick. */
     if (llgo_osal_isr_ring_get((uintptr_t)q, item)) {
+        osal_dump_msg(q, item, "isr");
         return 1;
     }
-    return llgo_osal_queue_recv(q, item, tick);
+    int32_t rc = llgo_osal_queue_recv(q, item, tick);
+    if (rc == 1) {
+        osal_dump_msg(q, item, "recv");
+    }
+    return rc;
 }
+
 
 /* ---- blob-facing helpers ---- */
 
