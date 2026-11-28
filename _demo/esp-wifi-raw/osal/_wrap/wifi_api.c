@@ -255,6 +255,14 @@ int llgo_wifi_set_sta_config(const char *ssid, const char *pass) {
 /* llgo_wifi_scan_start: build a wifi_scan_config_t. channel==0 scans all
  * channels (the demo's gate-3 flow); active scan with default times. */
 int llgo_wifi_scan_start(uint32_t channel, int32_t show_hidden, int32_t block) {
+    /* The vendor IDF scan example passes config=NULL for an all-channel
+     * active scan, and that path is the one proven to work on emu. The
+     * struct branch additionally dereferences wifi_scan_config_t fields
+     * whose ABI we cannot fully pin against the closed blob, so mirror the
+     * vendor example: NULL unless a specific channel was requested. */
+    if (channel == 0 && show_hidden == 0) {
+        return esp_wifi_scan_start(NULL, block != 0);
+    }
     wifi_scan_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.channel = (uint8_t)channel;
