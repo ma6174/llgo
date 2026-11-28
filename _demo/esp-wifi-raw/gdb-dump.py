@@ -100,6 +100,6 @@ with open(outpath, 'w') as f:
     # the blob scan object written by net80211_data_ptr_init into the g_scan
     # slot (nm: g_scan = 0x2f07ff8c; value = 0x2f006aa0 static obj in .bss)
     SCAN_OBJ = 0x2f003914
-    f.write(fmt('gic568', SCAN_OBJ, read_mem(s, SCAN_OBJ, 0x8)))
+    f.write(fmt('gic_ic_fields', 0x2f0033ac+0x10, read_mem(s, 0x2f0033ac+0x10, 8)))
 print('dumped to', outpath)
 s.close()
