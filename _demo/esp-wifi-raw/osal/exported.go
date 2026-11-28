@@ -119,8 +119,8 @@ func osalTaskDelete(h uintptr) {
 //
 //export llgo_osal_task_delay
 func osalTaskDelay(tickMs uint32) {
-	prev := curTask
-	defer func() { curTask = prev }()
+	prev := curTaskValue()
+	defer func() { slotSet(prev) }()
 	if tickMs == 0 {
 		return
 	}

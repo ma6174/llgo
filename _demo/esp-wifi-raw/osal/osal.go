@@ -106,7 +106,6 @@ func cfatal(msg string) {
 // task identity
 // ---------------------------------------------------------------------------
 
-var curTask uintptr
 
 // taskRecord is one registered task. user==true marks pseudo-tasks handed to
 // goroutines calling the WiFi API: they never run a library task body, they
@@ -153,19 +152,22 @@ func taskByHandle(h uintptr) *taskRecord {
 }
 
 func setCurTask(t uintptr) (prev uintptr) {
-	prev = curTask
-	curTask = t
-	return prev
+	return slotSet(t)
+}
+
+func curTaskValue() uintptr {
+	return slotGet()
 }
 
 func currentTask() *taskRecord {
-	if curTask != 0 {
-		if t := taskByHandle(curTask); t != nil {
+	h := curTaskValue()
+	if h != 0 {
+		if t := taskByHandle(h); t != nil {
 			return t
 		}
 	}
 	t := allocTask("user", true)
-	curTask = t.id
+	slotSet(t.id)
 	return t
 }
 
@@ -241,8 +243,8 @@ func semTake(h uintptr, tickMs uint32) bool {
 	if s == nil {
 		return false
 	}
-	prev := curTask
-	defer func() { curTask = prev }()
+	prev := curTaskValue()
+	defer func() { slotSet(prev) }()
 	if tickMs == timeBlocking {
 		<-s.ch
 		return true
@@ -325,7 +327,7 @@ func mutexLock(h uintptr, tickMs uint32) bool {
 	if m == nil {
 		return false
 	}
-	self := curTask
+	self := curTaskValue()
 	if m.owner == self && self != 0 {
 		// Recursive re-entry by the owner never blocks.
 		m.count++
@@ -355,7 +357,7 @@ func mutexUnlock(h uintptr) bool {
 	if m == nil {
 		return false
 	}
-	if m.owner != curTask || m.count == 0 {
+	if m.owner != curTaskValue() || m.count == 0 {
 		// Not the owner: FreeRTOS returns failure; never unlock someone
 		// else's mutex (the library has a 250 ms-starvation class of bug
 		// here per espradio, which we surface instead of papering over).
@@ -431,8 +433,8 @@ func queueSend(h uintptr, item uintptr, tickMs uint32, front bool) bool {
 	if q == nil || item == 0 {
 		return false
 	}
-	prev := curTask
-	defer func() { curTask = prev }()
+	prev := curTaskValue()
+	defer func() { slotSet(prev) }()
 	buf := make([]byte, q.itemSize)
 	queueCopy(uintptr(unsafe0(buf)), item, uintptr(q.itemSize))
 	deadline := time.Now().Add(time.Duration(tickMs) * time.Millisecond)
@@ -488,8 +490,8 @@ func queueRecv(h uintptr, item uintptr, tickMs uint32) bool {
 	if q == nil || item == 0 {
 		return false
 	}
-	prev := curTask
-	defer func() { curTask = prev }()
+	prev := curTaskValue()
+	defer func() { slotSet(prev) }()
 	deadline := time.Now().Add(time.Duration(tickMs) * time.Millisecond)
 	for {
 		// ISR-staged items first: the MAC ISR posts into the C staging ring
@@ -609,8 +611,8 @@ func egWaitBits(h uintptr, bitsToWait uint32, clear bool, all bool, tickMs uint3
 	if eg == nil {
 		return 0
 	}
-	prev := curTask
-	defer func() { curTask = prev }()
+	prev := curTaskValue()
+	defer func() { slotSet(prev) }()
 	deadline := time.Now().Add(time.Duration(tickMs) * time.Millisecond)
 	for {
 		eg.mu.Lock()

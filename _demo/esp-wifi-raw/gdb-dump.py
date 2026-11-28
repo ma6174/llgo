@@ -81,7 +81,7 @@ def fmt(name, base, data):
     return '\n'.join(lines) + '\n'
 
 with open(outpath, 'w') as f:
-    f.write(fmt('gic_568_area', GIC+0x560, read_mem(s, GIC+0x560, 0x20)))
-    f.write(fmt('gic_568_area', 0x2f0033ac+0x560, read_mem(s, 0x2f0033ac+0x560, 0x20)))
+    f.write(fmt('scanfield_1a8_1c8', GIC+0x3ac+0x1a8, read_mem(s, GIC+0x3ac+0x1a8, 0x20)))
+    
 print('dumped to', outpath)
 s.close()

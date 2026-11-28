@@ -9,6 +9,7 @@ package osal
 // Boot re-creates the pruned package variables and performs the event
 // registration that used to live in the package init.
 func Boot() {
+	taskSlots = map[uintptr]uintptr{}
 	semDead = map[uintptr]bool{}
 	mutexDead = map[uintptr]bool{}
 	queueDead = map[uintptr]bool{}
