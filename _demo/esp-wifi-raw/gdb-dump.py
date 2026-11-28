@@ -33,6 +33,8 @@ def parse_args():
     return int(sys.argv[1]), sys.argv[2]
 
 port, outpath = parse_args()
+GIC = 0x2f0033ac
+
 s = socket.create_connection(('127.0.0.1', port), timeout=10)
 s.settimeout(10)
 try:
@@ -79,27 +81,7 @@ def fmt(name, base, data):
     return '\n'.join(lines) + '\n'
 
 with open(outpath, 'w') as f:
-    f.write(fmt('clic_intctl', 0x10801000, regs['clic_intctl_0_63']))
-    f.write(fmt('intmatrix', 0x20585000, regs['intmatrix']))
-    f.write(fmt('modem_syscon', 0x20109C00, regs['modem_syscon_0x00_0x80']))
-    f.write(fmt('modem_lpcon', 0x2010F000, regs['modem_lpcon_0x00_0x60']))
-    f.write(fmt('hpsys_modem_conf', 0x205871E0, regs['hpsys_clkrst_modem_conf']))
-    f.write(fmt('wifi_mac', 0x20104000, regs['wifi_mac_int_ena_status']))
-    gic = struct.unpack('<I', regs.get('rom_slots', b'\0'*8)[:4])[0] if 'rom_slots' in regs else 0
-    try:
-        slots = read_mem(s, 0x2f07ff84, 4)
-        gic = struct.unpack('<I', slots)[0]
-        f.write(f'g_ic_ptr = {gic:#x} g_scan_slot = {struct.unpack(chr(60)+chr(73), slots[4:8])[0]:#x}\n')
-        if gic:
-            f.write(fmt('g_ic_0x180_0x1c0', gic+0x180, read_mem(s, gic+0x180, 0x40)))
-        # the blob's own g_ic global lives in our .bss (nm wifi.bin.elf: g_ic)
-        BLOB_GIC = 0x2f006aa0
-        f.write(fmt('scan_obj_0x1a0_0x220', BLOB_GIC+0x1a0, read_mem(s, BLOB_GIC+0x1a0, 0x80)))
-    except Exception as e:
-        f.write(f'g_ic read err {e}\n')
-    # the blob scan object written by net80211_data_ptr_init into the g_scan
-    # slot (nm: g_scan = 0x2f07ff8c; value = 0x2f006aa0 static obj in .bss)
-    SCAN_OBJ = 0x2f003914
-    f.write(fmt('gic_ic_fields', 0x2f0033ac+0x10, read_mem(s, 0x2f0033ac+0x10, 8)))
+    f.write(fmt('gic_568_area', GIC+0x560, read_mem(s, GIC+0x560, 0x20)))
+    f.write(fmt('gic_568_area', 0x2f0033ac+0x560, read_mem(s, 0x2f0033ac+0x560, 0x20)))
 print('dumped to', outpath)
 s.close()
