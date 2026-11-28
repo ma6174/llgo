@@ -106,7 +106,6 @@ func cfatal(msg string) {
 // task identity
 // ---------------------------------------------------------------------------
 
-
 // taskRecord is one registered task. user==true marks pseudo-tasks handed to
 // goroutines calling the WiFi API: they never run a library task body, they
 // just need a stable identity and thread semaphore for the duration of one
@@ -504,6 +503,11 @@ func queueRecv(h uintptr, item uintptr, tickMs uint32) bool {
 		if len(q.items) > 0 {
 			buf := q.items[0]
 			q.items = q.items[1:]
+			// Broadcast a free slot: close wakes every blocked sender, each
+			// re-checks capacity on its own next pass, so none are lost when
+			// multiple senders queue up.
+			close(q.wake)
+			q.wake = make(chan struct{})
 			q.mu.Unlock()
 			queueCopy(item, uintptr(unsafe0(buf)), uintptr(q.itemSize))
 			return true
@@ -541,8 +545,6 @@ func queueMsgWaiting(h uintptr) uint32 {
 	defer q.mu.Unlock()
 	return uint32(len(q.items))
 }
-
-
 
 // ---------------------------------------------------------------------------
 // event groups

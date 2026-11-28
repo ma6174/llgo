@@ -12,11 +12,11 @@ import "unsafe"
 
 // WiFiMode values from the pinned esp_wifi_types_generic.h.
 const (
-	ModeNULL     = 0
-	ModeSTA      = 1
-	ModeAP       = 2
-	ModeAPSTA    = 3
-	ModeNAN      = 4
+	ModeNULL  = 0
+	ModeSTA   = 1
+	ModeAP    = 2
+	ModeAPSTA = 3
+	ModeNAN   = 4
 )
 
 // Storage options (esp_wifi_set_storage).
@@ -148,14 +148,14 @@ func apiCall(f func() int32) int32 {
 
 // Event IDs (esp_wifi_types_generic.h wifi_event_t).
 const (
-	EvWiFiReady        = 0
-	EvScanDone         = 1
-	EvStaStart         = 2
-	EvStaStop          = 3
-	EvStaConnected     = 4
-	EvStaDisconnected  = 5
-	EvApStart          = 6
-	EvApStop           = 7
+	EvWiFiReady       = 0
+	EvScanDone        = 1
+	EvStaStart        = 2
+	EvStaStop         = 3
+	EvStaConnected    = 4
+	EvStaDisconnected = 5
+	EvApStart         = 6
+	EvApStop          = 7
 )
 
 var eventCh = make(chan Event, 32)

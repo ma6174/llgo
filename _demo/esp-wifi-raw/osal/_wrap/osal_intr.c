@@ -253,7 +253,10 @@ __attribute__((naked, aligned(64))) void llgo_osal_trap_entry(void) {
  * Called once before any WiFi init (Go side), after which the CLIC, matrix
  * and handler table drive the blob's interrupt setup.
  */
-static uint32_t s_osal_mtvt_table[OSAL_INT_COUNT + OSAL_INT_OFFSET];
+/* 64B-aligned: the CLIC mtvt base is WARL-truncated on real hardware
+ * (emu tolerates any value), matching the IDF freertos port mtvt table. */
+static uint32_t s_osal_mtvt_table[OSAL_INT_COUNT + OSAL_INT_OFFSET]
+    __attribute__((aligned(64)));
 
 void llgo_osal_intr_init(void) {
     /* The wifi lines run through the ROM's vectored interrupt framework,

@@ -239,33 +239,13 @@ void llgo_osal_wifi_delete_queue(void *q) {
 /* ---- queue_recv with ISR-ring drain (Go owns the park; this is the C
  * wrapper the table points at) ---- */
 
-/* Forensics: dump the wifi g_ic scan-window words + the message's handler
- * slot before the wifi task body dereferences it. Offsets chosen from the
- * gate-3 crash analysis (g_ic+0x560/0x568/0x570); g_ic itself lives at
- * g_ic_ptr slot 0x2f0033ac-linked blob global. */
-void osal_dump_msg(void *q, void *item, const char *how) {
-    volatile uint32_t *gic = (volatile uint32_t *)0x2f0033ac;
-    uint32_t *m = (uint32_t *)item;
-    char buf[192];
-    snprintf(buf, sizeof(buf),
-             "qmsg %s q=0x%p h=0x%08x a0=0x%08x a1=0x%08x | gic+0x560=0x%08x +0x568=0x%08x +0x570=0x%08x\n",
-             how, q, m[0], m[1], m[2],
-             gic[0x560 / 4], gic[0x568 / 4], gic[0x570 / 4]);
-    write(1, buf, strlen(buf));
-}
-
 int32_t llgo_osal_queue_recv_wrap(void *q, void *item, uint32_t tick) {
     /* Drain staged ISR items first so an ISR post wakes the parked recv on
      * its next bounded-park tick. */
     if (llgo_osal_isr_ring_get((uintptr_t)q, item)) {
-        osal_dump_msg(q, item, "isr");
         return 1;
     }
-    int32_t rc = llgo_osal_queue_recv(q, item, tick);
-    if (rc == 1) {
-        osal_dump_msg(q, item, "recv");
-    }
-    return rc;
+    return llgo_osal_queue_recv(q, item, tick);
 }
 
 
@@ -716,8 +696,11 @@ void llgo_osal_wifi_reset_mac(void) {
  *   - HP_SYS_CLKRST.modem_conf: apb+core clk on, out of reset;
  *   - MODEM_SYSCON.clk_conf_force_on (+0x0c): the wifi/bt/fe keep-clock
  *     bytes IDF leaves at 0x64 each;
- *   - MODEM_SYSCON.clk_conf_power_st maps (+0x14): reserved byte = 0xff,
- *     zb/fe/bt/wifi icg maps 0x7/0xe/0x7/0xf, modem_peri 0x3.
+ *   - MODEM_SYSCON.clk_conf_power_st maps (+0x14): raw value 0x0038e7ff;
+ *     nibble sequence from LSB is f/f/7/e/8/3/0/0. The per-field name split
+ *     (which nibble is zb/fe/bt/wifi icg vs modem_peri) is not verified
+ *     against the IDF S31 header - only the whole-word idle value is
+ *     evidence-backed. Do not re-derive field names from this comment.
  * Without the MODEM_SYSCON gates the wifi MAC block gets no clock and never
  * asserts its interrupt (the first scan attempt hung exactly there). */
 #define OSAL_MODEMSYS_BASE 0x20109C00u /* MODEM_BASE(0x20100000)+0x9c00 */
@@ -797,8 +780,12 @@ int llgo_osal_nvs_erase_key(uint32_t h, const char *k) { (void)h; (void)k; retur
 static void osal_coex_task_yield_from_isr(void) { llgo_osal_task_yield_from_isr(); }
 static void *osal_coex_semphr_create(uint32_t max, uint32_t init) { return llgo_osal_semphr_create(max, init); }
 static void osal_coex_semphr_delete(void *sem) { llgo_osal_semphr_delete(sem); }
-static int32_t osal_coex_semphr_take_from_isr(void *sem, void *hptw) { return llgo_osal_queue_send_from_isr(sem, hptw, 0) ? 1 : 0; }
-static int32_t osal_coex_semphr_give_from_isr(void *sem, void *hptw) { (void)sem; (void)hptw; return 1; }
+/* espradio parity (ref/espradio_osi.c): _semphr_take_from_isr is a
+ * non-blocking take (tick 0), _semphr_give_from_isr a real give. These coex
+ * callbacks run from task context (coex scheduling), never the MAC HW ISR,
+ * so the Go-backed semaphore primitives are safe here. */
+static int32_t osal_coex_semphr_take_from_isr(void *sem, void *hptw) { (void)hptw; return llgo_osal_semphr_take(sem, 0); }
+static int32_t osal_coex_semphr_give_from_isr(void *sem, void *hptw) { (void)hptw; return llgo_osal_semphr_give(sem); }
 static int32_t osal_coex_semphr_take(void *sem, uint32_t tick) { return llgo_osal_semphr_take(sem, tick); }
 static int32_t osal_coex_semphr_give(void *sem) { return llgo_osal_semphr_give(sem); }
 static int osal_coex_is_in_isr(void) { return llgo_osal_is_from_isr_context(); }

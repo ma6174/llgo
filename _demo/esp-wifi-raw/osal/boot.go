@@ -15,6 +15,7 @@ func Boot() {
 	queueDead = map[uintptr]bool{}
 	egDead = map[uintptr]bool{}
 	timers = map[uintptr]*timerState{}
+	timerSrv = make(chan struct{}, 1)
 	eventHandlers = map[uintptr]map[int32][]*EventHandler{}
 	eventCh = make(chan Event, 32)
 	bootInstall()
